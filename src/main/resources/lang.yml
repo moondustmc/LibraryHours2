@@ -7,6 +7,8 @@ palette:
 messages:
   enter: "#cca66eYou have entered the quiet area"
   leave: "#99683dYou have left the quiet area"
+  chat-blocked: "#99683dThat chat cannot cross the quiet area boundary."
+  local-chat: "#cca66e[Library] #99683d%player%#332920: #cca66e%message%"
   action-bar:
     coins: "#cca66e+%amount% monies"
     exp: "#99683d+%amount% exp"

@@ -11,10 +11,12 @@ import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
+import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -43,17 +45,26 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
     private static final Pattern HEX_COLOR_PATTERN = Pattern.compile("(?i)(?:&?#)([0-9a-f]{6})");
     private static final String VENTURE_CHAT_PLUGIN_NAME = "VentureChat";
     private static final String VENTURE_CHAT_EVENT_CLASS = "mineverse.Aust1n46.chat.api.events.VentureChatEvent";
+    private static final String PAPER_ASYNC_CHAT_EVENT_CLASS = "io.papermc.paper.event.player.AsyncChatEvent";
+    private static final Set<String> PRIVATE_MESSAGE_COMMANDS = Set.of(
+            "m", "message", "msg", "pm", "r", "reply", "tell", "w", "whisper"
+    );
+    private static final Set<String> TARGETED_PRIVATE_MESSAGE_COMMANDS = Set.of(
+            "m", "message", "msg", "pm", "tell", "w", "whisper"
+    );
 
     private final Map<String, LibraryRegion> libraryRegions = new HashMap<>();
     private final Map<UUID, Long> coinBalances = new HashMap<>();
     private final Map<UUID, Location> pos1Selections = new HashMap<>();
     private final Map<UUID, Location> pos2Selections = new HashMap<>();
+    private final Map<UUID, Set<String>> suspendedVentureChatListening = new HashMap<>();
     private final Set<UUID> playersInLibrary = new HashSet<>();
 
     private FileConfiguration langConfig;
     private File playerDataFile;
     private FileConfiguration playerDataConfig;
     private boolean ventureChatHookRegistered;
+    private boolean paperChatHookRegistered;
 
     @Override
     public void onEnable() {
@@ -73,12 +84,15 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
         }
 
         getServer().getPluginManager().registerEvents(this, this);
+        registerPaperChatHookIfAvailable();
         registerVentureChatHookIfAvailable();
         startPassiveRewardTask();
+        startChatReceiveBlockTask();
     }
 
     @Override
     public void onDisable() {
+        restoreAllVentureChatListening();
         playersInLibrary.clear();
         pos1Selections.clear();
         pos2Selections.clear();
@@ -206,6 +220,9 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
         for (Player player : Bukkit.getOnlinePlayers()) {
             if (isInsideAnyLibraryRegion(player.getLocation())) {
                 playersInLibrary.add(player.getUniqueId());
+                suspendVentureChatListening(player);
+            } else {
+                restoreVentureChatListening(player);
             }
         }
     }
@@ -213,6 +230,20 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
     private void startPassiveRewardTask() {
         long intervalTicks = Math.max(20L, getConfig().getLong("rewards.interval-seconds", 60L) * 20L);
         Bukkit.getScheduler().runTaskTimer(this, this::rewardPlayersInLibrary, intervalTicks, intervalTicks);
+    }
+
+    private void startChatReceiveBlockTask() {
+        Bukkit.getScheduler().runTaskTimer(this, this::enforceChatReceiveBlocking, 20L, 20L);
+    }
+
+    private void enforceChatReceiveBlocking() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (isInsideAnyLibraryRegion(player.getLocation())) {
+                suspendVentureChatListening(player);
+            } else {
+                restoreVentureChatListening(player);
+            }
+        }
     }
 
     private void rewardPlayersInLibrary() {
@@ -277,14 +308,61 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
         pos2Selections.put(playerId, copiedLocation);
     }
 
-    @EventHandler
-    public void onPlayerChat(AsyncPlayerChatEvent event) {
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPlayerChatBeforePlugins(AsyncPlayerChatEvent event) {
         Set<String> senderRegions = getRegionNamesAt(event.getPlayer().getLocation());
-        if (senderRegions.isEmpty()) {
+        if (!senderRegions.isEmpty()) {
+            event.setCancelled(true);
+            sendLocalLibraryChat(event.getPlayer(), event.getMessage(), senderRegions);
             return;
         }
 
-        filterRecipientsBySharedLibraryRegion(senderRegions, event.getRecipients());
+        if (hasVentureChatConversationInLibrary(event.getPlayer())) {
+            event.setCancelled(true);
+            sendQuietChatBlockedMessage(event.getPlayer());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onPlayerChatAfterPlugins(AsyncPlayerChatEvent event) {
+        filterRecipientsByLibraryIsolation(event.getPlayer(), event.getRecipients());
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onPlayerCommandPreprocess(PlayerCommandPreprocessEvent event) {
+        if (libraryRegions.isEmpty()) {
+            return;
+        }
+
+        String commandName = getBaseCommandName(event.getMessage());
+        if (commandName == null || !PRIVATE_MESSAGE_COMMANDS.contains(commandName)) {
+            return;
+        }
+
+        if (isInsideAnyLibraryRegion(event.getPlayer().getLocation())) {
+            event.setCancelled(true);
+            sendQuietChatBlockedMessage(event.getPlayer());
+            return;
+        }
+
+        if (TARGETED_PRIVATE_MESSAGE_COMMANDS.contains(commandName) && targetsPlayerInLibrary(event.getMessage())) {
+            event.setCancelled(true);
+            sendQuietChatBlockedMessage(event.getPlayer());
+            return;
+        }
+
+        if (("r".equals(commandName) || "reply".equals(commandName)) && hasVentureChatReplyTargetInLibrary(event.getPlayer())) {
+            event.setCancelled(true);
+            sendQuietChatBlockedMessage(event.getPlayer());
+        }
+    }
+
+    private void filterRecipientsByLibraryIsolation(Player sender, Set<Player> recipients) {
+        if (libraryRegions.isEmpty()) {
+            return;
+        }
+
+        recipients.removeIf(recipient -> !canReceiveChat(sender, recipient));
     }
 
     @EventHandler
@@ -299,16 +377,19 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
         Player player = event.getPlayer();
         if (isInsideAnyLibraryRegion(player.getLocation())) {
             playersInLibrary.add(player.getUniqueId());
+            suspendVentureChatListening(player);
             sendConfiguredMessage(player, "messages.enter");
             return;
         }
 
         playersInLibrary.remove(player.getUniqueId());
+        restoreVentureChatListening(player);
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         UUID playerId = event.getPlayer().getUniqueId();
+        restoreVentureChatListening(event.getPlayer());
         playersInLibrary.remove(playerId);
         pos1Selections.remove(playerId);
         pos2Selections.remove(playerId);
@@ -331,11 +412,13 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
 
         if (isInside) {
             playersInLibrary.add(playerId);
+            suspendVentureChatListening(event.getPlayer());
             sendConfiguredMessage(event.getPlayer(), "messages.enter");
             return;
         }
 
         playersInLibrary.remove(playerId);
+        restoreVentureChatListening(event.getPlayer());
         sendConfiguredMessage(event.getPlayer(), "messages.leave");
     }
 
@@ -346,12 +429,231 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
                 && from.getBlockZ() == to.getBlockZ();
     }
 
-    private void filterRecipientsBySharedLibraryRegion(Set<String> senderRegions, Set<Player> recipients) {
-        recipients.removeIf(recipient -> {
-            Set<String> recipientRegions = getRegionNamesAt(recipient.getLocation());
-            recipientRegions.retainAll(senderRegions);
+    private boolean canReceiveChat(Player sender, Player recipient) {
+        Set<String> recipientRegions = getRegionNamesAt(recipient.getLocation());
+        if (sender == null) {
             return recipientRegions.isEmpty();
-        });
+        }
+
+        Set<String> senderRegions = getRegionNamesAt(sender.getLocation());
+        if (senderRegions.isEmpty()) {
+            return recipientRegions.isEmpty();
+        }
+        if (recipientRegions.isEmpty()) {
+            return false;
+        }
+
+        recipientRegions.retainAll(senderRegions);
+        return !recipientRegions.isEmpty();
+    }
+
+    private boolean sharesLibraryRegion(Set<String> senderRegions, Player recipient) {
+        Set<String> recipientRegions = getRegionNamesAt(recipient.getLocation());
+        recipientRegions.retainAll(senderRegions);
+        return !recipientRegions.isEmpty();
+    }
+
+    private String getBaseCommandName(String message) {
+        String trimmed = message.trim();
+        if (!trimmed.startsWith("/")) {
+            return null;
+        }
+
+        String commandName = trimmed.split("\\s+", 2)[0].substring(1);
+        int namespaceIndex = commandName.indexOf(':');
+        if (namespaceIndex >= 0) {
+            commandName = commandName.substring(namespaceIndex + 1);
+        }
+
+        return commandName.toLowerCase(Locale.ROOT);
+    }
+
+    private boolean targetsPlayerInLibrary(String message) {
+        String[] parts = message.trim().split("\\s+", 3);
+        if (parts.length < 2) {
+            return false;
+        }
+
+        Player target = Bukkit.getPlayerExact(parts[1]);
+        if (target == null) {
+            target = Bukkit.getPlayer(parts[1]);
+        }
+
+        return target != null && isInsideAnyLibraryRegion(target.getLocation());
+    }
+
+    private boolean hasVentureChatConversationInLibrary(Player sender) {
+        Plugin ventureChatPlugin = getServer().getPluginManager().getPlugin(VENTURE_CHAT_PLUGIN_NAME);
+        if (ventureChatPlugin == null || !ventureChatPlugin.isEnabled()) {
+            return false;
+        }
+
+        try {
+            Class<?> apiClass = ventureChatPlugin.getClass().getClassLoader().loadClass("mineverse.Aust1n46.chat.api.MineverseChatAPI");
+            Object chatPlayer = apiClass.getMethod("getOnlineMineverseChatPlayer", Player.class).invoke(null, sender);
+            if (chatPlayer == null || !(Boolean) chatPlayer.getClass().getMethod("hasConversation").invoke(chatPlayer)) {
+                return false;
+            }
+
+            Object conversationValue = chatPlayer.getClass().getMethod("getConversation").invoke(chatPlayer);
+            if (!(conversationValue instanceof UUID conversationId)) {
+                return false;
+            }
+
+            Player target = Bukkit.getPlayer(conversationId);
+            return target != null && isInsideAnyLibraryRegion(target.getLocation());
+        } catch (ReflectiveOperationException | ClassCastException exception) {
+            getLogger().warning("VentureChat conversation check failed: " + exception.getMessage());
+            return false;
+        }
+    }
+
+    private boolean hasVentureChatReplyTargetInLibrary(Player sender) {
+        Object chatPlayer = getVentureChatPlayer(sender);
+        if (chatPlayer == null) {
+            return false;
+        }
+
+        try {
+            if (!(Boolean) chatPlayer.getClass().getMethod("hasReplyPlayer").invoke(chatPlayer)) {
+                return false;
+            }
+
+            Object replyValue = chatPlayer.getClass().getMethod("getReplyPlayer").invoke(chatPlayer);
+            if (!(replyValue instanceof UUID replyTargetId)) {
+                return false;
+            }
+
+            Player target = Bukkit.getPlayer(replyTargetId);
+            return target != null && isInsideAnyLibraryRegion(target.getLocation());
+        } catch (ReflectiveOperationException | ClassCastException exception) {
+            getLogger().warning("VentureChat reply target check failed: " + exception.getMessage());
+            return false;
+        }
+    }
+
+    private void sendQuietChatBlockedMessage(Player player) {
+        if (Bukkit.isPrimaryThread()) {
+            sendConfiguredMessage(player, "messages.chat-blocked");
+            return;
+        }
+
+        Bukkit.getScheduler().runTask(this, () -> sendConfiguredMessage(player, "messages.chat-blocked"));
+    }
+
+    private void sendLocalLibraryChat(Player sender, String message, Set<String> senderRegions) {
+        if (!Bukkit.isPrimaryThread()) {
+            Set<String> copiedRegions = new HashSet<>(senderRegions);
+            Bukkit.getScheduler().runTask(this, () -> sendLocalLibraryChat(sender, message, copiedRegions));
+            return;
+        }
+
+        String formattedMessage = getLang("messages.local-chat", Map.of(
+                "%player%", sender.getDisplayName(),
+                "%message%", message,
+                "%regions%", String.join(", ", new TreeSet<>(senderRegions))
+        ));
+        if (formattedMessage.isBlank()) {
+            formattedMessage = colorize("#cca66e[Library] #99683d" + sender.getDisplayName() + "#332920: #cca66e" + message);
+        }
+
+        for (Player recipient : Bukkit.getOnlinePlayers()) {
+            if (sharesLibraryRegion(senderRegions, recipient)) {
+                recipient.sendMessage(formattedMessage);
+            }
+        }
+        Bukkit.getConsoleSender().sendMessage(formattedMessage);
+    }
+
+    private void suspendVentureChatListening(Player player) {
+        Object chatPlayer = getVentureChatPlayer(player);
+        if (chatPlayer == null) {
+            return;
+        }
+
+        try {
+            Object listeningValue = chatPlayer.getClass().getMethod("getListening").invoke(chatPlayer);
+            if (!(listeningValue instanceof Set<?> rawListening)) {
+                return;
+            }
+
+            Set<String> currentListening = new HashSet<>();
+            for (Object channelName : rawListening) {
+                if (channelName instanceof String name) {
+                    currentListening.add(name);
+                }
+            }
+            if (currentListening.isEmpty()) {
+                return;
+            }
+
+            suspendedVentureChatListening.computeIfAbsent(player.getUniqueId(), ignored -> new HashSet<>(currentListening));
+            for (String channelName : currentListening) {
+                chatPlayer.getClass().getMethod("removeListening", String.class).invoke(chatPlayer, channelName);
+            }
+            synchronizeVentureChatPlayer(chatPlayer);
+        } catch (ReflectiveOperationException exception) {
+            getLogger().warning("VentureChat listening suspension failed: " + exception.getMessage());
+        }
+    }
+
+    private void restoreVentureChatListening(Player player) {
+        Set<String> suspendedListening = suspendedVentureChatListening.get(player.getUniqueId());
+        if (suspendedListening == null) {
+            return;
+        }
+
+        Object chatPlayer = getVentureChatPlayer(player);
+        if (chatPlayer == null) {
+            return;
+        }
+
+        try {
+            for (String channelName : suspendedListening) {
+                chatPlayer.getClass().getMethod("addListening", String.class).invoke(chatPlayer, channelName);
+            }
+            synchronizeVentureChatPlayer(chatPlayer);
+            suspendedVentureChatListening.remove(player.getUniqueId());
+        } catch (ReflectiveOperationException exception) {
+            getLogger().warning("VentureChat listening restore failed: " + exception.getMessage());
+        }
+    }
+
+    private void restoreAllVentureChatListening() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            restoreVentureChatListening(player);
+        }
+        suspendedVentureChatListening.clear();
+    }
+
+    private Object getVentureChatPlayer(Player player) {
+        Plugin ventureChatPlugin = getServer().getPluginManager().getPlugin(VENTURE_CHAT_PLUGIN_NAME);
+        if (ventureChatPlugin == null || !ventureChatPlugin.isEnabled()) {
+            return null;
+        }
+
+        try {
+            Class<?> apiClass = ventureChatPlugin.getClass().getClassLoader().loadClass("mineverse.Aust1n46.chat.api.MineverseChatAPI");
+            return apiClass.getMethod("getOnlineMineverseChatPlayer", Player.class).invoke(null, player);
+        } catch (ReflectiveOperationException exception) {
+            getLogger().warning("VentureChat player lookup failed: " + exception.getMessage());
+            return null;
+        }
+    }
+
+    private void synchronizeVentureChatPlayer(Object chatPlayer) {
+        Plugin ventureChatPlugin = getServer().getPluginManager().getPlugin(VENTURE_CHAT_PLUGIN_NAME);
+        if (ventureChatPlugin == null || !ventureChatPlugin.isEnabled()) {
+            return;
+        }
+
+        try {
+            Class<?> mineverseChatClass = ventureChatPlugin.getClass().getClassLoader().loadClass("mineverse.Aust1n46.chat.MineverseChat");
+            Class<?> mineverseChatPlayerClass = ventureChatPlugin.getClass().getClassLoader().loadClass("mineverse.Aust1n46.chat.api.MineverseChatPlayer");
+            mineverseChatClass.getMethod("synchronize", mineverseChatPlayerClass, boolean.class).invoke(null, chatPlayer, true);
+        } catch (ReflectiveOperationException exception) {
+            getLogger().warning("VentureChat synchronization failed: " + exception.getMessage());
+        }
     }
 
     private void registerVentureChatHookIfAvailable() {
@@ -385,18 +687,9 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
     private void handleVentureChatEvent(org.bukkit.event.Event event) {
         try {
             Object usernameValue = event.getClass().getMethod("getUsername").invoke(event);
-            if (!(usernameValue instanceof String senderName)) {
-                return;
-            }
-
-            Player sender = Bukkit.getPlayerExact(senderName);
-            if (sender == null) {
-                return;
-            }
-
-            Set<String> senderRegions = getRegionNamesAt(sender.getLocation());
-            if (senderRegions.isEmpty()) {
-                return;
+            Player sender = null;
+            if (usernameValue instanceof String senderName) {
+                sender = Bukkit.getPlayerExact(senderName);
             }
 
             Object recipientsValue = event.getClass().getMethod("getRecipients").invoke(event);
@@ -412,14 +705,94 @@ public final class LibraryHours extends JavaPlugin implements TabExecutor, Liste
             }
 
             for (Player recipient : recipients) {
-                Set<String> recipientRegions = getRegionNamesAt(recipient.getLocation());
-                recipientRegions.retainAll(senderRegions);
-                if (recipientRegions.isEmpty()) {
+                if (!canReceiveChat(sender, recipient)) {
                     rawRecipients.remove(recipient);
                 }
             }
         } catch (ReflectiveOperationException exception) {
             getLogger().warning("VentureChat hook failed while filtering recipients: " + exception.getMessage());
+        }
+    }
+
+    private void registerPaperChatHookIfAvailable() {
+        if (paperChatHookRegistered) {
+            return;
+        }
+
+        try {
+            Class<?> rawEventClass = getServer().getClass().getClassLoader().loadClass(PAPER_ASYNC_CHAT_EVENT_CLASS);
+            if (!org.bukkit.event.Event.class.isAssignableFrom(rawEventClass)) {
+                return;
+            }
+
+            @SuppressWarnings("unchecked")
+            Class<? extends org.bukkit.event.Event> eventClass = (Class<? extends org.bukkit.event.Event>) rawEventClass;
+            EventExecutor executor = (listener, event) -> handlePaperChatEvent(event);
+            getServer().getPluginManager().registerEvent(eventClass, this, EventPriority.HIGHEST, executor, this, true);
+            paperChatHookRegistered = true;
+            getLogger().info("Hooked Paper chat recipient filtering for quiet regions.");
+        } catch (ClassNotFoundException ignored) {
+            // Spigot does not provide Paper's AsyncChatEvent.
+        }
+    }
+
+    private void handlePaperChatEvent(org.bukkit.event.Event event) {
+        try {
+            Object playerValue = event.getClass().getMethod("getPlayer").invoke(event);
+            if (!(playerValue instanceof Player sender)) {
+                return;
+            }
+
+            Set<String> senderRegions = getRegionNamesAt(sender.getLocation());
+            if (!senderRegions.isEmpty()) {
+                if (event instanceof Cancellable cancellable) {
+                    cancellable.setCancelled(true);
+                }
+                sendLocalLibraryChat(sender, extractPaperChatMessage(event), senderRegions);
+                return;
+            }
+
+            if (hasVentureChatConversationInLibrary(sender)) {
+                if (event instanceof Cancellable cancellable) {
+                    cancellable.setCancelled(true);
+                }
+                sendQuietChatBlockedMessage(sender);
+                return;
+            }
+
+            Object viewersValue = event.getClass().getMethod("viewers").invoke(event);
+            if (!(viewersValue instanceof Set<?> rawViewers)) {
+                return;
+            }
+
+            List<Player> viewers = new ArrayList<>();
+            for (Object viewer : rawViewers) {
+                if (viewer instanceof Player player) {
+                    viewers.add(player);
+                }
+            }
+
+            for (Player viewer : viewers) {
+                if (!canReceiveChat(sender, viewer)) {
+                    rawViewers.remove(viewer);
+                }
+            }
+        } catch (ReflectiveOperationException exception) {
+            getLogger().warning("Paper chat hook failed while filtering viewers: " + exception.getMessage());
+        }
+    }
+
+    private String extractPaperChatMessage(org.bukkit.event.Event event) {
+        try {
+            Object messageComponent = event.getClass().getMethod("message").invoke(event);
+            ClassLoader classLoader = event.getClass().getClassLoader();
+            Class<?> serializerClass = classLoader.loadClass("net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer");
+            Class<?> componentClass = classLoader.loadClass("net.kyori.adventure.text.Component");
+            Object serializer = serializerClass.getMethod("plainText").invoke(null);
+            return (String) serializerClass.getMethod("serialize", componentClass).invoke(serializer, messageComponent);
+        } catch (ReflectiveOperationException | ClassCastException exception) {
+            getLogger().warning("Paper chat message extraction failed: " + exception.getMessage());
+            return "";
         }
     }
 
