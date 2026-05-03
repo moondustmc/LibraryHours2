@@ -1,0 +1,14 @@
+name: LibraryHours
+version: '${version}'
+
+main: com.moondust.libraryHours.LibraryHours
+api-version: '1.21'
+softdepend: [VentureChat]
+commands:
+  library:
+    description: Configure the library region and view library rewards.
+    usage: /library <pos1|pos2|save|remove|list|info|reload|balance>
+permissions:
+  libraryhours.admin:
+    description: Allows configuring the library reward region.
+    default: op

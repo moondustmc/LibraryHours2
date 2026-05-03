@@ -1,0 +1,49 @@
+palette:
+  primary: "#cca66e"
+  secondary: "#99683d"
+  tertiary: "#664930"
+  dark: "#332920"
+
+messages:
+  enter: "#cca66eYou have entered the quiet area"
+  leave: "#99683dYou have left the quiet area"
+  action-bar:
+    coins: "#cca66e+%amount% monies"
+    exp: "#99683d+%amount% exp"
+
+commands:
+  no-permission: "#99683dYou do not have permission to configure the library region."
+  reload:
+    success: "#cca66eReloaded #99683dconfig.yml #cca66eand #99683dlang.yml#cca66e."
+  balance: "#cca66eLibrary coins: #99683d%amount%"
+  players-only:
+    positions: "#99683dOnly players can set library positions."
+    save: "#99683dOnly players can save library regions."
+    balance: "#99683dOnly players can view a personal library coin balance."
+  positions:
+    set: "#cca66eLibrary #664930%position% #cca66eset to #99683d%x%#332920, #99683d%y%#332920, #99683d%z% #cca66ein #99683d%world%#cca66e."
+  region:
+    invalid-name: "#99683dRegion name must only use letters, numbers, hyphens, or underscores."
+    selection-missing: "#99683dSet both #cca66e/library pos1 #99683dand #cca66e/library pos2 #99683dbefore saving a region."
+    selection-world-mismatch: "#99683dpos1 and pos2 must be in the same world."
+    saved: "#cca66eSaved library region '#99683d%name%#cca66e'."
+    updated: "#cca66eUpdated library region '#99683d%name%#cca66e'."
+    removed: "#cca66eRemoved library region '#99683d%name%#cca66e'."
+    not-found: "#99683dNo library region named '#cca66e%name%#99683d' exists."
+    none-configured: "#99683dNo library regions are configured."
+    list: "#cca66eLibrary regions: #99683d%regions%"
+    info:
+      count: "#cca66eLibrary region count: #99683d%count%"
+      names: "#cca66eRegions: #99683d%regions%"
+      detail: "#cca66eLibrary region '#99683d%name%#cca66e': #99683d%world% #664930%min_x%#332920, #664930%min_y%#332920, #664930%min_z% #cca66e-> #99683d%max_x%#332920, #99683d%max_y%#332920, #99683d%max_z%"
+      rewards: "#cca66ePassive rewards every #99683d%seconds%#cca66es: #99683d%exp% exp#332920, #99683d%coins% coins"
+  usage:
+    header: "#cca66eLibrary commands:"
+    pos1: "#99683d/library pos1"
+    pos2: "#99683d/library pos2"
+    save: "#99683d/library save <name>"
+    remove: "#99683d/library remove <name>"
+    list: "#99683d/library list"
+    info: "#99683d/library info [name]"
+    reload: "#99683d/library reload"
+    balance: "#99683d/library balance"

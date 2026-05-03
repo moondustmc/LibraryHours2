@@ -1,0 +1,14 @@
+library:
+  regions: {}
+
+rewards:
+  interval-seconds: 60
+  exp: 5
+  coins: 10
+
+messages:
+  enter: "&7You have entered the quiet area"
+  leave: "&7You have left the quiet area"
+  action-bar:
+    coins: "&a+%amount% monies"
+    exp: "&a+%amount% exp"
